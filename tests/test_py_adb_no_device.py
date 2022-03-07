@@ -4,7 +4,8 @@ import unittest
 import sys
 sys.path.append('..')
 
-from airtest.core.android.py_adb import ADB, AdbError, DeviceConnectionError
+from airtest.core.android.py_adb import ADB
+from airtest.core.error import AdbError, DeviceConnectionError
 
 
 class TestADBWithoutDevice(unittest.TestCase):
@@ -12,20 +13,16 @@ class TestADBWithoutDevice(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.adb = ADB(auto_connect=False)
+        cls.adb = ADB()
+        cls.adb.start_server()
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.adb.disconnect()
-
-    def test_start_server(self):
-        self.adb.start_server()
-
-    def test_stop_server(self):
-        self.adb.kill_server()
+        cls.adb.kill_server()
 
     def test_version(self):
-        self.assertIn("1.0.40", self.adb.version())
+        self.assertIsInstance(self.adb.version(), int)
 
     def test_cmd(self):
         with self.assertRaises(AdbError):

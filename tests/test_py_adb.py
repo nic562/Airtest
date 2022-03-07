@@ -7,38 +7,42 @@ from six import text_type
 import sys
 sys.path.append('..')
 
-from airtest.core.android.py_adb import ADB, AdbShellError
-from testconf import IMG, APK, PKG
+from airtest.core.android.py_adb import ADB
+from testconf import IMG, PKG
 
 
-class TestADBWithDevice(unittest.TestCase):
+class TestADBWithDeviceBase(unittest.TestCase):
     adb = None
     serial = None
 
     @classmethod
     def setUpClass(cls) -> None:
-        adb = ADB(auto_connect=False)
+        adb = ADB()
         devices = adb.devices()
-        adb.disconnect()
         if not devices:
             raise RuntimeError("At lease one adb device required")
-        cls.serial = devices[0]
-        cls.adb = ADB(cls.serial)
+        cls.serial = devices[0][0]
+        cls.adb = adb
+        cls.adb.connect(cls.serial)
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.adb.disconnect()
+        cls.adb.kill_server()
+
+
+class TestADBWithDevice(TestADBWithDeviceBase):
 
     def test_get_status(self):
         self.assertEqual(self.adb.get_status(), self.adb.status_device)
 
     def test_shell_pwd(self):
-        output = self.adb.run_shell("pwd")
+        output = self.adb.shell("pwd")
         self.assertEqual(output.strip(), "/")
         self.assertIsInstance(output, text_type)
 
     def test_shell(self):
-        output = self.adb.run_shell("time")
+        output = self.adb.shell("time")
         self.assertIsInstance(output, text_type)
 
     def test_getprop(self):
@@ -58,25 +62,15 @@ class TestADBWithDevice(unittest.TestCase):
         tmp_img_path = tmp_dir + "/" + img_name
         self.adb.push(IMG, tmp_img_path)
         self.assertTrue(self.adb.exists_file(tmp_img_path))
-        tmp_files = self.adb.run_shell("ls " + tmp_dir)
+        tmp_files = self.adb.shell("ls " + tmp_dir)
         self.assertIn(img_name, tmp_files, "The `%s` file not in /data/local/tmp!" % img_name)
 
         self.adb.pull(tmp_img_path, "./" + img_name)
         self.assertTrue(os.path.exists(img_name))
         os.remove(img_name)
 
-        self.adb.run_shell('rm ' + tmp_img_path)
+        self.adb.shell('rm ' + tmp_img_path)
         self.assertFalse(self.adb.exists_file(tmp_img_path))
-
-    # def test_logcat(self):
-    #     rs = self.adb.logcat()
-    #     line_cnt = 0
-    #     for line in rs:
-    #         self.assertIsInstance(line, str)
-    #         line_cnt += 1
-    #         if line_cnt > 3:
-    #             break
-    #     self.assertGreater(line_cnt, 0)
 
     def test_install(self):
         # output = self.adb.install_app(APK)
@@ -93,6 +87,22 @@ class TestADBWithDevice(unittest.TestCase):
         gateway = self.adb.get_gateway_address()
         if gateway:
             self.assertEqual(len(gateway.split('.')), 4)
+
+
+class TestADBWithDeviceLogcat(TestADBWithDeviceBase):
+
+    def test_logcat(self):
+        rs = self.adb.logcat()
+        line_cnt = 0
+        for line in rs:
+            self.assertIsInstance(line, str)
+            line_cnt += 1
+            if line_cnt > 3:
+                break
+        self.assertGreater(line_cnt, 0)
+
+
+class TestADBWithDeviceForwards(TestADBWithDeviceBase):
 
     def test_get_forwards(self):
         self.adb.remove_forward()
@@ -124,7 +134,7 @@ class TestADBWithDevice(unittest.TestCase):
         """
         for port in ['tcp:10010', 'tcp:10020', 'tcp:10030']:
             self.adb.forward(port, port)
-        self.adb._cleanup_forwards()
+        self.adb.remove_forward()
         self.assertEqual(len(list(self.adb.get_forwards())), 0)
 
 

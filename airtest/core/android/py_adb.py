@@ -5,88 +5,73 @@ import sys
 import time
 import random
 import warnings
-import platform
-import subprocess
-from functools import wraps
 import threading
-from copy import copy
-from six import PY3, binary_type
+from six import PY3
 from six.moves import reduce
 
-from adb import adb_commands
-from adb import sign_pythonrsa
-from adb.adb_protocol import InvalidResponseError, InvalidCommandError
+from ppadb.client import Client as AdbClient
+from ppadb.device import Device
+from ppadb import InstallError
 
-from airtest.core.android.constant import (DEFAULT_ADB_PATH, IP_PATTERN, SDK_VERISON_ANDROID7)
-from airtest.core.error import (AdbError, AdbShellError, AirtestError,
-                                DeviceConnectionError)
-from airtest.utils.compat import decode_path, SUBPROCESS_FLAG, proc_communicate_timeout, raisefrom
+from airtest.core.android.constant import IP_PATTERN, SDK_VERISON_ANDROID7
+from airtest.core.error import AdbError, AdbShellError, AirtestError, DeviceConnectionError
+from airtest.utils.compat import decode_path
 from airtest.utils.logger import get_logger
 from airtest.utils.retry import retries
-from airtest.utils.snippet import get_std_encoding, reg_cleanup, split_cmd, make_file_executable
+from airtest.utils.snippet import get_std_encoding, reg_cleanup, split_cmd
 
 LOGGING = get_logger(__name__)
 
 
-def recon_on_error(func):
-    @wraps(func)
-    def _fun(self, *args, **kv):
-        try:
-            return func(self, *args, **kv)
-        except (AttributeError, InvalidResponseError, InvalidCommandError) as e:
-            LOGGING.warning('`%s` [%s, %s] run Error: %s\nTrying to reconnect adb!' % (func.__name__, args, kv, e))
-            self.adb.Close()
-            self.adb = self.connect()
-            return recon_on_error(func)(self, *args, **kv)
+class MyIO(object):
+    def __init__(self, socket):
+        self.socket = socket
+        self.fd = self.socket.makefile(encoding='utf8')
+        self.stdout = self.fd
 
-    return _fun
+    def poll(self):
+        return
+
+    def kill(self):
+        try:
+            self.fd.close()
+            self.socket.close()
+        except Exception as e:
+            LOGGING.warn('Close Connection error: %s', e)
 
 
 class ADB(object):
-    """adb client object class"""
+    """adb client object class
+    Base on pure-python-adb
+    see: https://github.com/Swind/pure-python-adb
+    """
 
     _instances = []
     status_device = "device"
     status_offline = "offline"
     SHELL_ENCODING = "utf-8"
 
-    def __init__(self, serial=None, adb_key_path=None, adb_path=None, display_id=None, auto_connect=True):
+    def __init__(self, serial=None, server_addr=None, display_id=None):
         self.serial = serial
-        self.adb_key_path = adb_key_path or '~/.android/adbkey'
-        self.adb_path = adb_path or self.builtin_adb_path()
-        self.display_id = display_id
-        self.adb = auto_connect and self.connect() or self.kill_adb()
+        self.start_server()
+        if server_addr:
+            host, port = server_addr.split(':')
+            self.adb_client = AdbClient(host=host, port=port)
+        else:
+            self.adb_client = AdbClient()
+        self.host = self.adb_client.host
+        self._dev = None
+        self.connect(serial)
         self._sdk_version = None
         self._line_breaker = None
         self._display_info = {}
         self._display_info_lock = threading.Lock()
-        self._forward_local_using = []
         self.__class__._instances.append(self)
 
-    @staticmethod
-    def builtin_adb_path():
-        """
-        Return built-in adb executable path
-
-        Returns:
-            adb executable path
-
-        """
-        system = platform.system()
-        machine = platform.machine()
-        adb_path = DEFAULT_ADB_PATH.get('{}-{}'.format(system, machine))
-        if not adb_path:
-            adb_path = DEFAULT_ADB_PATH.get(system)
-        if not adb_path:
-            raise RuntimeError("No adb executable supports this platform({}-{}).".format(system, machine))
-
-        # overwrite uiautomator adb
-        if "ANDROID_HOME" in os.environ:
-            del os.environ["ANDROID_HOME"]
-        if system != "Windows":
-            # chmod +x adb
-            make_file_executable(adb_path)
-        return adb_path
+    def get_device(self) -> Device:
+        if self._dev:
+            return self._dev
+        raise RuntimeError("No device is connected! Please call `connect` first!")
 
     def start_server(self):
         """
@@ -94,9 +79,8 @@ class ADB(object):
 
         Returns:
             None
-
         """
-        return self.run_cmd("start-server")
+        os.system('adb start-server')
 
     def kill_server(self):
         """
@@ -106,7 +90,7 @@ class ADB(object):
             None
 
         """
-        return self.run_cmd("kill-server")
+        return self.adb_client.kill()
 
     def version(self):
         """
@@ -116,52 +100,7 @@ class ADB(object):
             command output
 
         """
-        return self.run_cmd("version").strip()
-
-    @staticmethod
-    def my_load_rsa_key_path(file_path):
-        # 原来的加载方法，在python3中问题兼容性问题
-        with open(file_path + '.pub', 'rb') as f:
-            pub = f.read()
-        with open(file_path, 'rb') as f:
-            pri = f.read()
-        return sign_pythonrsa.PythonRSASigner(pub, pri)
-
-    @staticmethod
-    def kill_adb():
-        LOGGING.warning('Trying to kill adb server...')
-        os.system('adb kill-server')
-
-    @classmethod
-    def connect_dev(cls, adb_key_path, serial=None) -> adb_commands.AdbCommands:
-        """
-        连接设备，可指定连接的具体设备名
-        :param adb_key_path: 与设备通讯的授权密钥
-        :param serial: 可选，设备号 (可通过adb devices查看)，不提供则连接第一个
-        :return:
-        """
-        dev = adb_commands.AdbCommands()
-        if adb_key_path.startswith('~'):
-            key_path = os.path.expanduser(adb_key_path)
-        else:
-            key_path = os.path.abspath(adb_key_path)
-        assert os.path.isfile(key_path), f'{key_path} 文件不存在'
-        _keys = [cls.my_load_rsa_key_path(key_path)]
-        cls.kill_adb()
-        find = False
-        if serial and serial.find(':') == -1:
-            for x in dev.Devices():
-                if x.serial_number == serial:
-                    find = True
-                    break
-            assert find, '设备 [%s] 未连接' % serial
-        try:
-            dev.ConnectDevice(rsa_keys=_keys, serial=serial and serial or None)
-        except InvalidCommandError as e:
-            dev.Close()
-            LOGGING.warning('Reconnect on error: {%s}' % e)
-            return cls.connect_dev(adb_key_path)
-        return dev
+        return self.adb_client.version()
 
     @staticmethod
     def format_cmd(cmd):
@@ -171,153 +110,88 @@ class ADB(object):
             cmd_list = [c.encode(get_std_encoding(sys.stdin)) for c in cmd_list]
         return ' '.join(cmd_list)
 
-    @recon_on_error
-    def run_shell(self, cmd, timeout_ms=None, clean_wrap=False):
+    def run_cmd(self, cmd: str):
+        try:
+            return self.adb_client._execute_cmd(f'host:{cmd}')
+        except RuntimeError as e:
+            raise AdbError("adb execute error:", e)
+
+    def start_shell(self, cmd, timeout_ms=None):
+        def handler(connection):
+            return MyIO(connection.socket)
+
+        return self.shell(cmd, timeout_ms, handler=handler)
+
+    def raw_shell(self, cmd, timeout_ms=None, ensure_unicode=True):
+        rs = self.shell(cmd, timeout_ms, ensure_unicode=False)
+        if ensure_unicode:
+            return rs
+        return str(rs)
+
+    def shell(self, cmd, timeout_ms=None, clean_wrap=False, handler=None, ensure_unicode=True):
         """
         执行命令
         :param cmd: 命令内容
         :param timeout_ms: 命令执行超时时间
         :param clean_wrap: 是否清理结果换行
+        :param handler: 结果处理函数
+        :param ensure_unicode: decode/encode unicode True or False, default is True
+            def func(connection):
+                try:
+                    while True:
+                        d = connection.read(1024)
+                        if not d:
+                            break
+                        print(d.decode('utf-8'))
+                finally:
+                    connection.close()
         :return:
         """
         _cmd = self.format_cmd(cmd)
         LOGGING.debug(f'adb shell {_cmd}')
-        rs = self.adb.Shell(_cmd, timeout_ms=timeout_ms)
-        if clean_wrap:
+        rs = self.get_device().shell(_cmd, handler=handler, timeout=timeout_ms,
+                                     decode=ensure_unicode and 'utf8' or None)
+        if clean_wrap and isinstance(rs, str):
             rs = rs.strip()
         return rs
 
-    @recon_on_error
-    def stream_shell(self, cmd, timeout_ms=None):
-        """
-        执行命令，返回输出流的迭代器，每次返回一行输出结果
-        :param cmd: 命令内容
-        :param timeout_ms: 命令执行超时时间
-        :return: 每行输出结果迭代
-        """
-        _cmd = self.format_cmd(cmd)
-        LOGGING.debug(f'adb (stream)shell {_cmd}')
-        return self.adb.StreamingShell(_cmd, timeout_ms=timeout_ms)
+    def devices(self, state=None, return_obj=False):
+        rs = self.adb_client.devices(state)
+        if return_obj:
+            return rs
+        return [(x.serial, x.get_state()) for x in rs]
 
-    def start_cmd(self, cmd):
-        _cmd = self.format_cmd(cmd)
-        s_cmd = '%s %s' % (self.adb_path, _cmd)
-        LOGGING.debug(s_cmd)
-        proc = subprocess.Popen(
-            s_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=SUBPROCESS_FLAG
-        )
-        return proc
-
-    def _run_cmd(self, cmd, timeout_ms=None, ensure_unicode=True):
-        # 有些指令在 python-adb 中不支持，需额外实现
-        proc = self.start_cmd(cmd)
-        if timeout_ms:
-            stdout, stderr = proc_communicate_timeout(proc, timeout_ms)
-        else:
-            stdout, stderr = proc.communicate()
-
-        if ensure_unicode:
-            stdout = stdout.decode(get_std_encoding(sys.stdout))
-            stderr = stderr.decode(get_std_encoding(sys.stderr))
-
-        if proc.returncode > 0:
-            # adb connection error
-            pattern = DeviceConnectionError.DEVICE_CONNECTION_ERROR
-            if isinstance(stderr, binary_type):
-                pattern = pattern.encode("utf-8")
-            if re.search(pattern, stderr):
-                raise DeviceConnectionError(stderr)
-            else:
-                raise AdbError(stdout, stderr)
-        return stdout
-
-    def run_cmd(self, cmd, timeout_ms=None, ensure_unicode=True):
-        need_reconnect = self.adb is not None
-        self.disconnect()  # 这里必须要先断开连接
-        try:
-            return self._run_cmd(cmd, timeout_ms, ensure_unicode)
-        finally:
-            if need_reconnect:
-                self.adb = self.connect()
-
-    def devices(self):
-        """
-        Perform `adb devices` command and return the list of adb devices
-
-        Returns:
-            list od adb devices
-
-        """
-        need_reconnect = self.adb is not None
-        self.disconnect()  # 这里必须要先断开连接
-        try:
-            device_list = []
-            rs = adb_commands.AdbCommands.Devices()
-            for x in rs:
-                device_list.append(x.serial_number)
-            return device_list
-        finally:
-            if need_reconnect:
-                self.adb = self.connect()
-
-    def connect(self) -> adb_commands.AdbCommands:
-        return self.connect_dev(self.adb_key_path, serial=self.serial)
+    def connect(self, serial=None):
+        s = serial or self.serial
+        if s:
+            self._dev = self.adb_client.device(s)
+            if not self._dev:
+                raise RuntimeError(f'No device found for [{serial}]')
+            self.serial = s
+        return self._dev
 
     def disconnect(self):
-        if self.adb:
-            self.adb.Close()
-            self.adb = None
+        if self._dev:
+            self._dev = None
 
     def get_status(self):
-        return self.adb.GetState().decode()
+        return self.get_device().get_state()
 
     def wait_for_device(self, timeout=5):
-        try:
-            return self.run_cmd('wait-for-device', timeout_ms=timeout)
-        except RuntimeError as e:
-            raisefrom(DeviceConnectionError, "device not ready", e)
+        while timeout:
+            ds = self.adb_client.devices()
+            if ds:
+                return
+            timeout -= 1
+            time.sleep(1)
+        raise DeviceConnectionError('device not ready')
 
     def keyevent(self, key_name):
-        """
-        Perform `adb shell input keyevent` command on the device
-
-        Args:
-            key_name: key event name
-
-        Returns:
-            None
-
-        """
-        self.run_shell(["input", "keyevent", key_name.upper()])
+        return self.get_device().input_keyevent(key_name.upper())
 
     def getprop(self, key, strip=True):
-        """
-        Perform `adb shell getprop` on the device
-
-        Args:
-            key: key value for property
-            strip: True or False to strip the return carriage and line break from returned string
-
-        Returns:
-            propery value
-
-        """
-        prop = self.run_shell(['getprop', key])
-        if strip:
-            if "\r\r\n" in prop:
-                # Some mobile phones will output multiple lines of extra log
-                prop = prop.split("\r\r\n")
-                if len(prop) > 1:
-                    prop = prop[-2]
-                else:
-                    prop = prop[-1]
-            else:
-                prop = prop.strip("\r\n")
-        return prop
+        ps = self.get_device().get_properties()
+        return ps[key]
 
     @property
     @retries(max_tries=3)
@@ -332,7 +206,6 @@ class ADB(object):
             self._sdk_version = int(self.getprop('ro.build.version.sdk'))
         return self._sdk_version
 
-    @recon_on_error
     def push(self, local, remote):
         """
         Perform `adb push` command
@@ -345,7 +218,7 @@ class ADB(object):
             None
 
         """
-        self.adb.Push(local, remote)
+        self.get_device().push(local, remote)
 
     def pull(self, remote, local):
         """
@@ -357,7 +230,7 @@ class ADB(object):
         Returns:
             None
         """
-        self.adb.Pull(remote, local)
+        self.get_device().pull(remote, local)
 
     def forward(self, local, remote, no_rebind=True):
         """
@@ -372,14 +245,7 @@ class ADB(object):
             None
 
         """
-        cmd = ['forward']
-        if no_rebind:
-            cmd.append('--no-rebind')
-        cmd.append(local)
-        cmd.append(remote)
-        self.run_cmd(cmd)
-        if local not in self._forward_local_using:
-            self._forward_local_using.append(local)
+        self.get_device().forward(local, remote, no_rebind)
 
     def get_forwards(self):
         """
@@ -392,16 +258,9 @@ class ADB(object):
             None
 
         """
-        out = self.run_cmd(['forward', '--list'])
-        for line in out.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            cols = line.split()
-            if len(cols) != 3:
-                continue
-            serial, local, remote = cols
-            yield serial, local, remote
+        fs = self.get_device().list_forward()
+        for local, remote in fs.items():
+            yield self.serial, local, remote
 
     @classmethod
     def get_available_forward_local(cls):
@@ -448,59 +307,23 @@ class ADB(object):
 
         """
         if local:
-            cmd = ["forward", "--remove", local]
+            self.get_device().killforward(local)
         else:
-            cmd = ["forward", "--remove-all"]
-        self.run_cmd(cmd)
-        # unregister for cleanup
-        if local in self._forward_local_using:
-            self._forward_local_using.remove(local)
+            self.get_device().killforward_all()
 
     def install_app(self, filepath, replace=False):
-        """
-        Perform `adb install` command
-
-        Args:
-            filepath: full path to file to be installed on the device
-            replace: force to replace existing application, default is False
-
-                e.g.["-t",  # allow test packages
-                    "-l",  # forward lock application,
-                    "-s",  # install application on sdcard,
-                    "-d",  # allow version code downgrade (debuggable packages only)
-                    "-g",  # grant all runtime permissions
-                ]
-
-        Returns:
-            command output
-
-        """
-
         if isinstance(filepath, str):
             filepath = decode_path(filepath)
 
         if not os.path.isfile(filepath):
             raise RuntimeError("file: %s does not exists" % (repr(filepath)))
+        try:
+            self.get_device().install(filepath, reinstall=replace)
+        except InstallError as e:
+            raise AdbShellError("Installation Failure", e)
 
-        out = self.adb.Install(filepath, replace_existing=replace)
-
-        if re.search(r"Failure \[.*?\]", out):
-            raise AdbShellError("Installation Failure", repr(out))
-
-        return out
-
-    @recon_on_error
     def uninstall_app(self, package):
-        """
-        Perform `adb uninstall` command
-        Args:
-            package: package name to be uninstalled from the device
-
-        Returns:
-            command output
-
-        """
-        return self.adb.Uninstall(package)
+        return self.get_device().uninstall(package)
 
     def snapshot(self):
         """
@@ -510,28 +333,11 @@ class ADB(object):
             command output (stdout)
 
         """
-        if self.display_id:
-            raw = self.run_shell('screencap -d {0} -p'.format(self.display_id), ensure_unicode=False)
-        else:
-            raw = self.run_shell('screencap -p', ensure_unicode=False)
-        return raw.replace(self.line_breaker, b"\n")
+        return self.get_device().screencap()
 
-    # PEP 3113 -- Removal of Tuple Parameter Unpacking
-    # https://www.python.org/dev/peps/pep-3113/
     def touch(self, tuple_xy):
-        """
-        Perform user input (touchscreen) on given coordinates
-
-        Args:
-            tuple_xy: coordinates (x, y)
-
-        Returns:
-            None
-
-        """
         x, y = tuple_xy
-        self.run_shell('input tap %d %d' % (x, y))
-        time.sleep(0.1)
+        self.get_device().input_tap(x, y)
 
     def swipe(self, tuple_x0y0, tuple_x1y1, duration=500):
         """
@@ -552,38 +358,30 @@ class ADB(object):
         # prot python 3
         x0, y0 = tuple_x0y0
         x1, y1 = tuple_x1y1
+        self.get_device().input_swipe(x0, y0, x1, y1, duration=duration)
 
-        version = self.sdk_version
-        if version <= 15:
-            raise AirtestError('swipe: API <= 15 not supported (version=%d)' % version)
-        elif version <= 17:
-            self.run_shell('input swipe %d %d %d %d' % (x0, y0, x1, y1))
-        else:
-            self.run_shell('input touchscreen swipe %d %d %d %d %d' % (x0, y0, x1, y1, duration))
-
-    @recon_on_error
     def logcat(self, grep_str="", extra_args="", read_timeout=10):
-        """
-        Perform `adb shell logcat` command and search for given patterns
 
-        Args:
-            grep_str: pattern to filter from the logcat output
-            extra_args: additional logcat arguments
-            read_timeout: time interval to read the logcat, default is 10
+        def handler(connection):
+            sk = connection.socket
+            try:
+                with sk.makefile(encoding='utf8') as file_obj:
+                    while True:
+                        d = file_obj.readline()
+                        data = d.strip()
+                        if not data:
+                            break
+                        if grep_str:
+                            if data.find(grep_str):
+                                yield data
+                            else:
+                                continue
+                        else:
+                            yield data
+            finally:
+                sk.close()
 
-        Yields:
-            logcat lines containing filtered patterns
-
-        Returns:
-            None
-
-        """
-        cmd = []
-        if extra_args:
-            cmd.append(extra_args)
-        if grep_str:
-            cmd.append(" | grep " + grep_str)
-        return self.adb.Logcat(self.format_cmd(cmd), timeout_ms=read_timeout)
+        return self.shell('logcat', timeout_ms=read_timeout, handler=handler)
 
     def exists_file(self, filepath):
         """
@@ -597,7 +395,7 @@ class ADB(object):
 
         """
         try:
-            out = self.run_shell(["ls", filepath])
+            out = self.shell(["ls", filepath])
         except AdbShellError:
             return False
         else:
@@ -616,26 +414,9 @@ class ADB(object):
         Raises:
             AdbShellError if no such file
         """
-        out = self.run_shell(["ls", "-l", filepath])
+        out = self.shell(["ls", "-l", filepath])
         file_size = int(out.split()[4])
         return file_size
-
-    def _cleanup_forwards(self):
-        """
-        Remove the local forward ports
-
-        Returns:
-            None
-        """
-        # remove forward成功后，会改变self._forward_local_using的内容，因此需要copy一遍
-        # After remove_forward() is successful, self._forward_local_using will be changed, so it needs to be copied
-        forward_local_list = copy(self._forward_local_using)
-        for local in forward_local_list:
-            try:
-                self.remove_forward(local)
-            except DeviceConnectionError:
-                # 如果手机已经被拔出，可以忽略
-                pass
 
     @property
     def line_breaker(self):
@@ -708,7 +489,7 @@ class ADB(object):
             max x and max y coordinates
 
         """
-        ret = self.run_shell('getevent -p').split('\n')
+        ret = self.shell('getevent -p').split('\n')
         max_x, max_y = None, None
         for i in ret:
             if i.find("0035") != -1:
@@ -735,7 +516,7 @@ class ADB(object):
         # get the effective screen resolution of the device
         result = None
         # get the corresponding mRestrictedScreen parameters according to the device serial number
-        dumpsys_info = self.run_shell("dumpsys window")
+        dumpsys_info = self.shell("dumpsys window")
         match = re.search(r'mRestrictedScreen=.+', dumpsys_info)
         if match:
             infoline = match.group(0).strip()  # like 'mRestrictedScreen=(0,0) 720x1184'
@@ -755,15 +536,15 @@ class ADB(object):
         """
         # use adb shell wm size
         displayInfo = {}
-        wm_size = re.search(r'(?P<width>\d+)x(?P<height>\d+)\s*$', self.raw_shell('wm size'))
+        wm_size = self.get_device().wm_size()
         if wm_size:
-            displayInfo = dict((k, int(v)) for k, v in wm_size.groupdict().items())
+            displayInfo = dict((k, int(v)) for k, v in wm_size._asdict().items())
             displayInfo['density'] = self._getDisplayDensity(strip=True)
             return displayInfo
 
         phyDispRE = re.compile(
             '.*PhysicalDisplayInfo{(?P<width>\d+) x (?P<height>\d+), .*, density (?P<density>[\d.]+).*')
-        out = self.run_shell('dumpsys display')
+        out = self.shell('dumpsys display')
         m = phyDispRE.search(out)
         if m:
             for prop in ['width', 'height']:
@@ -777,7 +558,7 @@ class ADB(object):
         phyDispRE = re.compile('\s*mUnrestrictedScreen=\((?P<x>\d+),(?P<y>\d+)\) (?P<width>\d+)x(?P<height>\d+)')
         # This is known to work on older versions (i.e. API 10) where mrestrictedScreen is not available
         dispWHRE = re.compile('\s*DisplayWidth=(?P<width>\d+) *DisplayHeight=(?P<height>\d+)')
-        out = self.run_shell('dumpsys window')
+        out = self.shell('dumpsys window')
         m = phyDispRE.search(out, 0)
         if not m:
             m = dispWHRE.search(out, 0)
@@ -796,7 +577,7 @@ class ADB(object):
         # gets C{mPhysicalDisplayInfo} values from dumpsys. This is a method to obtain display dimensions and density
         phyDispRE = re.compile('Physical size: (?P<width>\d+)x(?P<height>\d+).*Physical density: (?P<density>\d+)',
                                re.S)
-        m = phyDispRE.search(self.run_shell('wm size; wm density'))
+        m = phyDispRE.search(self.shell('wm size; wm density'))
         if m:
             for prop in ['width', 'height']:
                 displayInfo[prop] = int(m.group(prop))
@@ -807,24 +588,7 @@ class ADB(object):
         return displayInfo
 
     def _getDisplayDensity(self, strip=True):
-        """
-        Get display density
-
-        Args:
-            strip: strip the output
-
-        Returns:
-            display density
-
-        """
-        BASE_DPI = 160.0
-        d = self.getprop('ro.sf.lcd_density', strip)
-        if d:
-            return float(d) / BASE_DPI
-        d = self.getprop('qemu.sf.lcd_density', strip)
-        if d:
-            return float(d) / BASE_DPI
-        return -1.0
+        return self.get_device().wm_density()
 
     def getDisplayOrientation(self):
         """
@@ -836,7 +600,7 @@ class ADB(object):
         """
         # another way to get orientation, for old sumsung device(sdk version 15) from xiaoma
         SurfaceFlingerRE = re.compile('orientation=(\d+)')
-        output = self.run_shell('dumpsys SurfaceFlinger')
+        output = self.shell('dumpsys SurfaceFlinger')
         m = SurfaceFlingerRE.search(output)
         if m:
             return int(m.group(1))
@@ -844,7 +608,7 @@ class ADB(object):
         # Fallback method to obtain the orientation
         # See https://github.com/dtmilano/AndroidViewClient/issues/128
         surfaceOrientationRE = re.compile('SurfaceOrientation:\s+(\d+)')
-        output = self.run_shell('dumpsys input')
+        output = self.shell('dumpsys input')
         m = surfaceOrientationRE.search(output)
         if m:
             return int(m.group(1))
@@ -882,7 +646,7 @@ class ADB(object):
         # adb shell dumpsys window displays | find "init="
         # 上面的命令行在dumpsys window里查找init=widthxheight，得到的结果是物理分辨率，且部分型号手机不止一个结果
         # 如果改为读取 cur=widthxheight 的数据，得到的是修改过分辨率手机的结果（例如三星S8）
-        actual = self.run_shell("dumpsys window displays")
+        actual = self.shell("dumpsys window displays")
         arr = re.findall(r'cur=(\d+)x(\d+)', actual)
         if len(arr) > 0:
             # 强制设定宽度width为更小的数字、height为更大的数字，避免因为各手机厂商返回结果的顺序不同导致问题
@@ -904,14 +668,7 @@ class ADB(object):
             top activity as a tuple: (package_name, activity_name, pid)
 
         """
-        dat = self.run_shell('dumpsys activity top')
-        activityRE = re.compile(r'\s*ACTIVITY ([A-Za-z0-9_.$]+)/([A-Za-z0-9_.$]+) \w+ pid=(\d+)')
-        # in Android8.0 or higher, the result may be more than one
-        m = activityRE.findall(dat)
-        if m:
-            return m[-1]
-        else:
-            raise AirtestError("Can not get top activity, output:%s" % dat)
+        return self.get_device().get_top_activity()
 
     def is_keyboard_shown(self):
         """
@@ -921,7 +678,7 @@ class ADB(object):
             True or False whether the keyboard is shown or not
 
         """
-        dim = self.run_shell('dumpsys input_method')
+        dim = self.shell('dumpsys input_method')
         if dim:
             return "mInputShown=true" in dim
         return False
@@ -938,13 +695,13 @@ class ADB(object):
 
         """
         screenOnRE = re.compile('mScreenOnFully=(true|false)')
-        m = screenOnRE.search(self.run_shell('dumpsys window policy'))
+        m = screenOnRE.search(self.shell('dumpsys window policy'))
         if m:
             return m.group(1) == 'true'
         else:
             # MIUI11
             screenOnRE = re.compile('screenState=(SCREEN_STATE_ON|SCREEN_STATE_OFF)')
-            m = screenOnRE.search(self.run_shell('dumpsys window policy'))
+            m = screenOnRE.search(self.shell('dumpsys window policy'))
             if m:
                 return m.group(1) == 'SCREEN_STATE_ON'
         raise AirtestError("Couldn't determine screen ON state")
@@ -961,10 +718,10 @@ class ADB(object):
 
         """
         lockScreenRE = re.compile('(?:mShowingLockscreen|isStatusBarKeyguard|showing)=(true|false)')
-        m = lockScreenRE.search(self.run_shell('dumpsys window policy'))
+        m = lockScreenRE.search(self.shell('dumpsys window policy'))
         if not m:
             raise AirtestError("Couldn't determine screen lock state")
-        return (m.group(1) == 'true')
+        return m.group(1) == 'true'
 
     def unlock(self):
         """
@@ -978,8 +735,8 @@ class ADB(object):
             Might not work on all devices
 
         """
-        self.run_shell('input keyevent MENU')
-        self.run_shell('input keyevent BACK')
+        self.shell('input keyevent MENU')
+        self.shell('input keyevent BACK')
 
     def get_package_version(self, package):
         """
@@ -992,11 +749,7 @@ class ADB(object):
             None if no info has been found, otherwise package version
 
         """
-        package_info = self.run_shell(['dumpsys', 'package', package])
-        matcher = re.search(r'versionCode=(\d+)', package_info)
-        if matcher:
-            return int(matcher.group(1))
-        return None
+        return self.get_device().get_package_version_name(package)
 
     def list_app(self, third_only=False):
         """
@@ -1023,7 +776,7 @@ class ADB(object):
         cmd = ["pm", "list", "packages"]
         if third_only:
             cmd.append("-3")
-        output = self.run_shell(cmd)
+        output = self.shell(cmd)
         packages = output.splitlines()
         # remove all empty string; "package:xxx" -> "xxx"
         packages = [p.split(":")[1] for p in packages if p]
@@ -1045,7 +798,7 @@ class ADB(object):
 
         """
         try:
-            output = self.run_shell(['pm', 'path', package])
+            output = self.shell(['pm', 'path', package])
         except AdbShellError:
             output = ""
         if 'package:' not in output:
@@ -1066,8 +819,8 @@ class ADB(object):
             True if package has been found
 
         """
-        output = self.run_shell(['dumpsys', 'package', package])
-        pattern = r'Package\s+\[' + str(package) + '\]'
+        output = self.shell(['dumpsys', 'package', package])
+        pattern = r'Package\s+\[' + str(package) + r'\]'
         match = re.search(pattern, output)
         if match is None:
             raise AirtestError('package "{}" not found'.format(package))
@@ -1087,9 +840,9 @@ class ADB(object):
 
         """
         if not activity:
-            self.run_shell(['monkey', '-p', package, '-c', 'android.intent.category.LAUNCHER', '1'])
+            self.shell(['monkey', '-p', package, '-c', 'android.intent.category.LAUNCHER', '1'])
         else:
-            self.run_shell(['am', 'start', '-n', '%s/%s.%s' % (package, package, activity)])
+            self.shell(['am', 'start', '-n', '%s/%s.%s' % (package, package, activity)])
 
     def start_app_timing(self, package, activity):
         """
@@ -1103,8 +856,8 @@ class ADB(object):
             app launch time
 
         """
-        out = self.run_shell(['am', 'start', '-S', '-W', '%s/%s' % (package, activity),
-                              '-c', 'android.intent.category.LAUNCHER', '-a', 'android.intent.action.MAIN'])
+        out = self.shell(['am', 'start', '-S', '-W', '%s/%s' % (package, activity),
+                          '-c', 'android.intent.category.LAUNCHER', '-a', 'android.intent.action.MAIN'])
         if not re.search(r"Status:\s*ok", out):
             raise AirtestError("Starting App: %s/%s Failed!" % (package, activity))
 
@@ -1126,7 +879,7 @@ class ADB(object):
             None
 
         """
-        self.run_shell(['am', 'force-stop', package])
+        self.shell(['am', 'force-stop', package])
 
     def clear_app(self, package):
         """
@@ -1139,7 +892,7 @@ class ADB(object):
             None
 
         """
-        self.run_shell(['pm', 'clear', package])
+        self.shell(['pm', 'clear', package])
 
     def text(self, content):
         """
@@ -1152,17 +905,17 @@ class ADB(object):
             None
         """
         if content.isalpha():
-            self.run_shell(["input", "text", content])
+            self.shell(["input", "text", content])
         else:
             # 如果同时包含了字母+数字，用input text整句输入可能会导致乱序
             for i in content:
-                self.run_shell(["input", "keyevent", "KEYCODE_" + i.upper()])
+                self.shell(["input", "keyevent", "KEYCODE_" + i.upper()])
 
     def get_ip_address_from_interface(self, interface):
         """Get device ip from target network interface."""
         # android >= 6.0: ip -f inet addr show {interface}
         try:
-            res = self.run_shell('ip -f inet addr show {}'.format(interface))
+            res = self.shell('ip -f inet addr show {}'.format(interface))
         except AdbShellError:
             res = ''
         matcher = re.search(r"inet (\d+\.){3}\d+", res)
@@ -1171,7 +924,7 @@ class ADB(object):
 
         # android >= 6.0 backup method: ifconfig
         try:
-            res = self.run_shell('ifconfig')
+            res = self.shell('ifconfig')
         except AdbShellError:
             res = ''
         matcher = re.search(interface + r'.*?inet addr:((\d+\.){3}\d+)', res, re.DOTALL)
@@ -1180,7 +933,7 @@ class ADB(object):
 
         # android <= 6.0: netcfg
         try:
-            res = self.run_shell('netcfg')
+            res = self.shell('netcfg')
         except AdbShellError:
             res = ''
         matcher = re.search(interface + r'.* ((\d+\.){3}\d+)/\d+', res)
@@ -1189,7 +942,7 @@ class ADB(object):
 
         # android <= 6.0 backup method: getprop dhcp.{}.ipaddress
         try:
-            res = self.run_shell('getprop dhcp.{}.ipaddress'.format(interface))
+            res = self.shell('getprop dhcp.{}.ipaddress'.format(interface))
         except AdbShellError:
             res = ''
         matcher = IP_PATTERN.search(res)
@@ -1232,7 +985,7 @@ class ADB(object):
         ip2int = lambda ip: reduce(lambda a, b: (a << 8) + b, map(int, ip.split('.')), 0)
         int2ip = lambda n: '.'.join([str(n >> (i << 3) & 0xFF) for i in range(0, 4)[::-1]])
         try:
-            res = self.run_shell('getprop dhcp.wlan0.gateway')
+            res = self.shell('getprop dhcp.wlan0.gateway')
         except AdbShellError:
             res = ''
         matcher = IP_PATTERN.search(res)
@@ -1254,7 +1007,7 @@ class ADB(object):
 
         """
         try:
-            res = self.run_shell('netcfg')
+            res = self.shell('netcfg')
         except AdbShellError:
             pass
         else:
@@ -1266,7 +1019,7 @@ class ADB(object):
         return 17
 
     def get_memory(self):
-        res = self.run_shell("dumpsys meminfo")
+        res = self.shell("dumpsys meminfo")
         pat = re.compile(r".*Total RAM:\s+(\S+)\s+", re.DOTALL)
         _str = pat.match(res).group(1)
         if ',' in _str:
@@ -1279,7 +1032,7 @@ class ADB(object):
         return res
 
     def get_storage(self):
-        res = self.run_shell("df /data")
+        res = self.shell("df /data")
         pat = re.compile(r".*\/data\s+(\S+)", re.DOTALL)
         if pat.match(res):
             _str = pat.match(res).group(1)
@@ -1305,7 +1058,7 @@ class ADB(object):
         return res
 
     def get_cpuinfo(self):
-        res = self.run_shell("cat /proc/cpuinfo").strip()
+        res = self.shell("cat /proc/cpuinfo").strip()
         cpuNum = res.count("processor")
         pat = re.compile(r'Hardware\s+:\s+(\w+.*)')
         m = pat.match(res)
@@ -1316,17 +1069,17 @@ class ADB(object):
         return dict(cpuNum=cpuNum, cpuName=cpuName)
 
     def get_cpufreq(self):
-        res = self.run_shell("cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        res = self.shell("cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
         num = round(float(res) / 1000 / 1000, 1)
         res = str(num) + 'GHz'
         return res.strip()
 
     def get_cpuabi(self):
-        res = self.run_shell("getprop ro.product.cpu.abi")
+        res = self.shell("getprop ro.product.cpu.abi")
         return res.strip()
 
     def get_gpu(self):
-        res = self.run_shell("dumpsys SurfaceFlinger")
+        res = self.shell("dumpsys SurfaceFlinger")
         pat = re.compile(r'GLES:\s+(.*)')
         m = pat.search(res)
         if not m:
@@ -1395,7 +1148,7 @@ class ADB(object):
             eg. (offset_x, offset_y, screen_width, screen_height)
 
         """
-        output = self.run_shell("dumpsys window windows")
+        output = self.shell("dumpsys window windows")
         windows = output.split("Window #")
         offsetx, offsety, width, height = 0, 0, info['width'], info['height']
         package = self._search_for_current_package(output)
@@ -1437,7 +1190,10 @@ class ADB(object):
 
 def cleanup_adb_forward():
     for adb in ADB._instances:
-        adb._cleanup_forwards()
+        try:
+            adb.remove_forward()
+        except RuntimeError:
+            continue
 
 
 reg_cleanup(cleanup_adb_forward)

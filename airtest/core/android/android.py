@@ -8,12 +8,12 @@ from airtest.core.device import Device
 from airtest.core.android.ime import YosemiteIme
 from airtest.core.android.constant import CAP_METHOD, TOUCH_METHOD, IME_METHOD, ORI_METHOD, \
     SDK_VERISON_ANDROID10
-from airtest.core.android.adb import ADB
+from airtest.core.android.py_adb import ADB
 
 from airtest.core.android.rotation import RotationWatcher, XYTransformer
 from airtest.core.android.recorder import Recorder
 from airtest.core.android.touch_methods.touch_proxy import TouchProxy
-from airtest.core.error import AdbError, AdbShellError
+from airtest.core.error import AdbError
 from airtest.core.android.cap_methods.screen_proxy import ScreenProxy
 
 # Compatible with old code
@@ -42,7 +42,7 @@ class Android(Device):
         self.display_id = display_id
         self.input_event = input_event
         # init adb
-        self.adb = ADB(self.serialno, server_addr=host, display_id=self.display_id, input_event=self.input_event)
+        self.adb = ADB(self.serialno, display_id=self.display_id)
         self.adb.wait_for_device()
         self.sdk_version = self.adb.sdk_version
         if self.sdk_version >= SDK_VERISON_ANDROID10 and self._touch_method == TOUCH_METHOD.MINITOUCH:

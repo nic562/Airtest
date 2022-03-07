@@ -77,8 +77,9 @@ class Minicap(BaseCap):
                 LOGGING.error(str(err))
                 version = -1
             else:
-                LOGGING.debug(output.strip())
-                m = re.match("version:(\d)", output)
+                _rs = str(output.strip())
+                LOGGING.debug(_rs)
+                m = re.match(r"version:(\d)", _rs)
                 if m:
                     version = int(m.group(1))
                 else:
@@ -171,8 +172,8 @@ class Minicap(BaseCap):
                 self.CMD + " -n 'airtest_minicap' -P %dx%d@%dx%d/%d -s" % params,
                 ensure_unicode=False,
             )
-        jpg_data = raw_data.split(b"for JPG encoder" + self.adb.line_breaker)[-1]
-        jpg_data = jpg_data.replace(self.adb.line_breaker, b"\n")
+        jpg_data = raw_data.split("for JPG encoder%s" % self.adb.line_breaker)[-1]
+        jpg_data = jpg_data.replace(str(self.adb.line_breaker), "\n")
         return jpg_data
 
     def _get_params(self, projection=None):
@@ -304,7 +305,7 @@ class Minicap(BaseCap):
             if line is None:
                 kill_proc(proc)
                 raise RuntimeError("minicap server setup timeout")
-            if b"Server start" in line:
+            if "Server start" in line:
                 break
 
         if proc.poll() is not None:
