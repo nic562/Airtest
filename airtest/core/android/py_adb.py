@@ -29,8 +29,23 @@ class MyIO(object):
         self.fd = self.socket.makefile(encoding='utf8')
         self.stdout = self.fd
 
+    @staticmethod
+    def _log_warn_not_implement(func_name):
+        LOGGING.warn(f'MyIO.{func_name} is not implement! Maybe something wrong!')
+
     def poll(self):
-        return
+        try:
+            self.socket.sendall(b'')
+        except Exception as e:
+            LOGGING.error(f'Checking connection error: {e}')
+            self.kill()
+            return False
+
+    def communicate(self):
+        self._log_warn_not_implement('communicate')
+
+    def wait(self):
+        self._log_warn_not_implement('wait')
 
     def kill(self):
         try:
