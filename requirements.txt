@@ -7,3 +7,6 @@ numpy<=1.19.3
 opencv-contrib-python
 facebook-wda>=1.3.3
 pywinauto==0.6.3
+
+git+git://github.com/nic562/pure-python-adb.git
+pure-python-adb==0.3.1
