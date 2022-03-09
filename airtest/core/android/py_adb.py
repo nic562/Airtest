@@ -753,6 +753,8 @@ class ADB(object):
         self.shell('input keyevent MENU')
         self.shell('input keyevent BACK')
 
+    PKG_VERSION_MATCHER = re.compile(r'versionCode=(\d+)')
+
     def get_package_version(self, package):
         """
         Perform `adb shell dumpsys package` and search for information about given package version
@@ -764,6 +766,13 @@ class ADB(object):
             None if no info has been found, otherwise package version
 
         """
+        package_info = self.shell(['dumpsys', 'package', package])
+        matcher = self.PKG_VERSION_MATCHER.search(package_info)
+        if matcher:
+            return int(matcher.group(1))
+        return None
+
+    def get_package_version_name(self, package):
         return self.get_device().get_package_version_name(package)
 
     def list_app(self, third_only=False):
