@@ -326,7 +326,7 @@ class ADB(object):
         else:
             self.get_device().killforward_all()
 
-    def install_app(self, filepath, replace=False):
+    def install_app(self, filepath, replace=False, **kv):
         if isinstance(filepath, str):
             filepath = decode_path(filepath)
 
